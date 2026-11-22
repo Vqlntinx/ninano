@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 
 STRIDE = 2
+INTERLEAVED_LAYOUT = ["lat", "lon", "component"]
+PLANAR_LAYOUT = ["component", "lat", "lon"]
 
 SRC = Path(__file__).resolve().parents[2] / "public_data" / "f32_packed"
 DST = Path(__file__).resolve().parents[2] / "public_data" / "f32_packed_05deg"
@@ -30,7 +32,6 @@ def main() -> None:
     manifest = json.loads((SRC / "manifest.json").read_text(encoding="utf-8"))
     lat_size = manifest["lat_size"]
     lon_size = manifest["lon_size"]
-    field_size = lat_size * lon_size
 
     new_lat_size = len(range(0, lat_size, STRIDE))
     new_lon_size = len(range(0, lon_size, STRIDE))
@@ -39,6 +40,9 @@ def main() -> None:
     scalar_vars = manifest["scalar"]["variables"]
     files = manifest["files"]
     folders = scalar_vars + ["wind"]
+    wind_layout = manifest["wind"].get("layout", INTERLEAVED_LAYOUT)
+    if wind_layout not in (INTERLEAVED_LAYOUT, PLANAR_LAYOUT):
+        raise ValueError(f"unsupported wind layout: {wind_layout}")
 
     print(f"src grid {lat_size}x{lon_size} -> dst grid {new_lat_size}x{new_lon_size}")
     print(f"files per folder: {len(files)} | folders: {folders}")
@@ -53,10 +57,12 @@ def main() -> None:
         for name in files:
             data = np.fromfile(SRC / folder / name, dtype="<f4")
             if is_wind:
-                # planar: 앞 절반 u10m, 뒤 절반 v10m. 각 성분을 따로 줄인다.
-                u = downsample_field(data[:field_size], lat_size, lon_size)
-                v = downsample_field(data[field_size:], lat_size, lon_size)
-                out = np.concatenate([u, v])
+                if wind_layout == INTERLEAVED_LAYOUT:
+                    # [u0, v0, u1, v1, ...] 배열의 공간축만 stride-2로 줄인다.
+                    out = data.reshape(lat_size, lon_size, 2)[::STRIDE, ::STRIDE, :].reshape(-1)
+                else:
+                    # 앞 절반 u10m, 뒤 절반 v10m인 planar 배열이다.
+                    out = data.reshape(2, lat_size, lon_size)[:, ::STRIDE, ::STRIDE].reshape(-1)
             else:
                 out = downsample_field(data, lat_size, lon_size)
             out.astype("<f4").tofile(DST / folder / name)
@@ -81,9 +87,14 @@ def main() -> None:
         "shape": [new_lat_size, new_lon_size],
         "bytes_per_file": new_field_size * 4,
     }
+    wind_shape = (
+        [new_lat_size, new_lon_size, 2]
+        if wind_layout == INTERLEAVED_LAYOUT
+        else [2, new_lat_size, new_lon_size]
+    )
     new_manifest["wind"] = {
         **manifest["wind"],
-        "shape": [2, new_lat_size, new_lon_size],
+        "shape": wind_shape,
         "bytes_per_file": new_field_size * 8,
     }
     (DST / "manifest.json").write_text(
